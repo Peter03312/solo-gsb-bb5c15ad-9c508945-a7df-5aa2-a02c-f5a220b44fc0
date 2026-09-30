@@ -1,0 +1,26 @@
+services:
+  cutting-planner:
+    build: .
+    image: cutting-planner:latest
+    container_name: cutting-planner
+    # 端口映射：宿主机 ${PORT:-8000} -> 容器 8000
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      # 容器内监听地址与端口（一般无需修改）
+      HOST: "0.0.0.0"
+      PORT: "8000"
+      # SQLite 数据库路径（位于挂载卷内，持久化）
+      DB_PATH: "/data/cutting.db"
+    volumes:
+      - cutting-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8000/api/state').status==200 else sys.exit(1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  cutting-data:

@@ -1,0 +1,5 @@
+# 本应用仅依赖 Python 3.11 标准库（wsgiref、http.server、sqlite3、json 等），
+# 不使用任何第三方包，因此无需 pip 安装。此文件仅为说明与工具链兼容而保留。
+#
+# 如需本地直接运行（Python >= 3.10）：
+#   python3 app/server.py

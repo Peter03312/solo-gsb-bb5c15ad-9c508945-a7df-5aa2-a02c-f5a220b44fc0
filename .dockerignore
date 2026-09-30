@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.sqlite
+*.sqlite3
+/data/
+/tmp/
+.git/
+.gitignore
+*.log
+test_*.py
+.env

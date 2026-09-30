@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>矩形纸张裁切排样</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>矩形纸张裁切排样 <span class="sub">小型印刷作坊 · 贯通刀裁切</span></h1>
+  <div class="verbox">
+    当前输入版本：<b id="inputVersion">—</b>
+    <span id="saveState" class="pill pill-none">无有效方案</span>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="card form-card">
+    <h2>输入参数</h2>
+    <form id="inputForm" autocomplete="off">
+      <div class="grid4">
+        <label>母纸长度 (mm)
+          <input type="number" min="1" step="1" id="sheet_w" required></label>
+        <label>母纸宽度 (mm)
+          <input type="number" min="1" step="1" id="sheet_h" required></label>
+        <label>刀缝宽度 (mm，≥0)
+          <input type="number" min="0" step="1" id="kerf" required></label>
+        <label>张数上限 (张)
+          <input type="number" min="1" step="1" id="max_sheets" required></label>
+      </div>
+
+      <h3>成品清单</h3>
+      <table class="ptable">
+        <thead><tr>
+          <th>名称</th><th>长 (mm)</th><th>宽 (mm)</th>
+          <th>份数</th><th>允许旋转</th><th></th>
+        </tr></thead>
+        <tbody id="productRows"></tbody>
+      </table>
+      <button type="button" id="addProduct" class="btn btn-ghost">+ 添加一种成品</button>
+
+      <div class="searchline">
+        <label class="statelim">搜索状态数上限
+          <input type="number" min="1" step="1" id="state_limit" required>
+          <small>越大搜得越彻底，耗时越长</small>
+        </label>
+        <div class="actions">
+          <button type="submit" class="btn btn-primary">保存输入并搜索</button>
+          <button type="button" id="solveOnly" class="btn">仅按当前输入试算</button>
+        </div>
+      </div>
+      <p id="formError" class="form-error" hidden></p>
+    </form>
+  </section>
+
+  <section class="card status-card" id="statusCard">
+    <h2>搜索结果</h2>
+    <div id="statusArea" class="status-area">
+      <p class="muted">填写参数后点击“保存输入并搜索”。</p>
+    </div>
+  </section>
+
+  <section class="card result-card" id="resultCard" hidden>
+    <div class="result-head">
+      <h2>排样方案</h2>
+      <div class="result-actions">
+        <button id="savePlan" class="btn btn-primary">保存此方案</button>
+        <a id="exportLink" class="btn btn-link disabled" href="/api/cutting-sheet"
+           target="_blank" rel="noopener">导出裁切单（打印）</a>
+        <button id="discardPlan" class="btn btn-ghost">废弃方案</button>
+      </div>
+    </div>
+    <p id="saveHint" class="muted"></p>
+    <div id="countsBox"></div>
+    <div id="sheetsBox" class="sheets-box"></div>
+    <div id="cutsBox"></div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
