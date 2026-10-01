@@ -32,6 +32,7 @@ def default_inputs() -> dict:
             {"name": "卡片B", "length": 200, "width": 60,
              "qty": 4, "rotatable": False},
         ],
+        "defects": [],
     }
 
 
@@ -101,13 +102,15 @@ class Database:
         data = json.loads(row["payload"])
         data["input_version"] = row["input_version"]
         data["updated_at"] = row["updated_at"]
+        # 兼容字段引入前保存的旧输入
+        data.setdefault("defects", [])
         return data
 
     def replace_inputs(self, inputs: dict) -> dict:
         """校验通过后的输入整体替换；版本号 +1，并使任何旧方案失效。"""
         clean = {k: inputs[k] for k in
                  ("sheet_w", "sheet_h", "kerf", "max_sheets",
-                  "state_limit", "products")}
+                  "state_limit", "products", "defects")}
         payload = json.dumps(clean, ensure_ascii=False)
         with self._lock, self._connect() as conn:
             row = conn.execute(

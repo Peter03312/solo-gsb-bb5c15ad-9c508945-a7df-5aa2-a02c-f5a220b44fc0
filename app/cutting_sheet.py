@@ -24,18 +24,38 @@ def _sheet_svg(sheet: dict, products: list, kerf: int, px: int = 520) -> str:
     W, H = sheet["width"], sheet["height"]
     scale = min(px / W, px / H)
     dw, dh = W * scale, H * scale
+    top = 34  # 顶部留出纸号标注
 
     parts = [
-        f'<svg viewBox="0 0 {dw + 40:.1f} {dh + 40:.1f}" '
-        f'width="{dw + 40:.1f}" height="{dh + 40:.1f}" '
+        f'<svg viewBox="0 0 {dw + 40:.1f} {dh + 40 + top:.1f}" '
+        f'width="{dw + 40:.1f}" height="{dh + 40 + top:.1f}" '
         'class="layout" xmlns="http://www.w3.org/2000/svg">',
-        f'<rect x="20" y="20" width="{dw:.1f}" height="{dh:.1f}" '
-        'fill="#fafafa" stroke="#222" stroke-width="2"/>',
+        f'<text x="20" y="14" font-size="12" fill="#7d3c98">'
+        f'物理纸号 {sheet.get("sheet_no", sheet["sheet_index"])}'
+        f'（实际用纸第 {sheet["sheet_index"]} 张）</text>',
+        # 瑕疵区（紫色斜纹，最底层；成品避让、刀路/废料可穿过）
+        f'<defs><pattern id="defpat{sheet["sheet_index"]}" '
+        'patternUnits="userSpaceOnUse" width="8" height="8" '
+        'patternTransform="rotate(45)">'
+        '<rect width="8" height="8" fill="#f3e8ff"/>'
+        '<line x1="0" y1="0" x2="0" y2="8" stroke="#9b59b6" stroke-width="2"/>'
+        '</pattern></defs>',
     ]
+    for r in sheet.get("defects", []):
+        x = 20 + r["x"] * scale
+        y = top + 20 * 0 + r["y"] * scale
+        parts.append(
+            f'<rect x="{x:.2f}" y="{y:.2f}" width="{r["w"] * scale:.2f}" '
+            f'height="{r["h"] * scale:.2f}" '
+            f'fill="url(#defpat{sheet["sheet_index"]})" '
+            'stroke="#9b59b6" stroke-width="1.2" stroke-dasharray="5 2"/>')
+    parts.append(
+        f'<rect x="20" y="{top}" width="{dw:.1f}" height="{dh:.1f}" '
+        'fill="none" stroke="#222" stroke-width="2"/>')
     # 刀缝（红色细条）
     for g in sheet["gaps"]:
         x = 20 + g["x"] * scale
-        y = 20 + g["y"] * scale
+        y = top + g["y"] * scale
         parts.append(
             f'<rect x="{x:.2f}" y="{y:.2f}" width="{max(g["w"] * scale,1):.2f}" '
             f'height="{g["h"] * scale:.2f}" fill="#d62728" opacity="0.85"/>')
@@ -44,7 +64,7 @@ def _sheet_svg(sheet: dict, products: list, kerf: int, px: int = 520) -> str:
         pi = lf["product"]
         stroke, fill = PALETTE[pi % len(PALETTE)]
         x = 20 + lf["x"] * scale
-        y = 20 + lf["y"] * scale
+        y = top + lf["y"] * scale
         w = lf["w"] * scale
         h = lf["h"] * scale
         prod = products[pi]
@@ -87,6 +107,7 @@ def render_cutting_sheet(inputs: dict, solution_row: dict,
     sheets_html = []
     for sheet in result["sheets"]:
         idx = sheet["sheet_index"]
+        no = sheet.get("sheet_no", idx)
         svg = _sheet_svg(sheet, products, inputs["kerf"])
         cut_rows = []
         for c in sheet["cuts"]:
@@ -106,13 +127,30 @@ def render_cutting_sheet(inputs: dict, solution_row: dict,
             "<th>刀口位置</th><th>刀长(mm)</th><th>一刀后余料</th>"
             "<th>二刀后余料</th></tr></thead><tbody>"
             + "".join(cut_rows) + "</tbody></table>")
+        defects = sheet.get("defects", [])
+        if defects:
+            def_rows = "".join(
+                f"<li>({r['x']}, {r['y']})，{r['w']}×{r['h']}mm"
+                f"（覆盖 x∈[{r['x']},{r['x'] + r['w']})，"
+                f"y∈[{r['y']},{r['y'] + r['h']})）</li>"
+                for r in defects)
+            def_box = (
+                '<div class="defbox"><b>本纸瑕疵区（成品已避让；'
+                '刀路/废料可穿过）：</b>'
+                f'<ul>{def_rows}</ul></div>')
+        else:
+            def_box = '<div class="defbox muted">本纸无登记瑕疵（完好母纸）。</div>'
         sheets_html.append(
-            f'<section class="sheet-block"><h2>第 {idx} 张母纸 '
+            f'<section class="sheet-block"><h2>实际用纸第 {idx} 张 · '
+            f'物理纸号 <b>{no}</b> '
             f'<span class="muted">（{sheet["width"]}×{sheet["height"]}mm，'
             f'本张 {len(sheet["leaves"])} 件 / {len(sheet["cuts"])} 刀）'
-            f'</span></h2><div class="cols"><div>{svg}</div>'
+            f'</span></h2>{def_box}'
+            f'<div class="cols"><div>{svg}</div>'
             f"<div>{cuts_table}</div></div></section>")
 
+    used_nos = sorted(s.get("sheet_no", i + 1)
+                      for i, s in enumerate(result["sheets"]))
     legend = "".join(
         f'<span class="lg"><i style="background:{PALETTE[i % len(PALETTE)][1]};'
         f'border-color:{PALETTE[i % len(PALETTE)][0]}"></i>{_esc(p["name"])}'
@@ -150,6 +188,14 @@ def render_cutting_sheet(inputs: dict, solution_row: dict,
         font-size:12.5px; }}
   .lg i {{ width:14px; height:14px; display:inline-block; border:1px solid;
           border-radius:2px; }}
+  .lg i.defect-sw {{ border:1px dashed #9b59b6 !important;
+    background: repeating-linear-gradient(45deg,#f3e8ff,#f3e8ff 2px,
+    #9b59b6 2px,#9b59b6 4px) !important; }}
+  .defbox {{ border:1px dashed #c9a7dd; background:#fbf7fe; border-radius:6px;
+             padding:8px 12px; margin:0 0 12px; font-size:12.5px; }}
+  .defbox ul {{ margin:6px 0 2px; padding-left:20px; }}
+  .defbox.muted {{ border-style:solid; border-color:#dde3ea;
+                   background:#f7f9fb; color:#777; }}
   .note {{ color:#a33; font-size:12px; }}
   @media print {{ body {{ margin:8mm; }} .sheet-block {{ border:none; }} }}
 </style></head>
@@ -165,6 +211,8 @@ def render_cutting_sheet(inputs: dict, solution_row: dict,
     <div>刀缝：<b>{inputs['kerf']}mm</b></div>
     <div>实际用纸：<b>{result['sheets_used']} 张</b>
       （上限 {inputs['max_sheets']}）</div>
+    <div>实际使用纸号：<b>{_esc("、".join(map(str, used_nos)))}</b>
+      （其余纸号跳过）</div>
     <div>搜索状态数：<b>{result.get('states_used','')}</b></div>
   </div>
 
@@ -174,7 +222,9 @@ def render_cutting_sheet(inputs: dict, solution_row: dict,
 
   <div class="legend"><b>图例：</b>{legend}
     <span class="lg"><i style="background:#d62728;border-color:#d62728"></i>刀缝</span>
-    <span class="note">（↻ 表示该件为旋转摆放；刀缝宽度 {inputs['kerf']}mm 已扣除）</span>
+    <span class="lg"><i class="defect-sw"></i>瑕疵区</span>
+    <span class="note">（↻ 表示该件为旋转摆放；刀缝宽度 {inputs['kerf']}mm 已扣除；
+    成品矩形不与瑕疵区有面积重叠，刀路、刀缝与废料允许穿过瑕疵区）</span>
   </div>
 
   {''.join(sheets_html)}

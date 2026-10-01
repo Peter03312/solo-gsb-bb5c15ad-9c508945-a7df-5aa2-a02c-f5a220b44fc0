@@ -198,13 +198,18 @@ class App:
             Product(p["name"], p["length"], p["width"], p["qty"],
                     bool(p["rotatable"]))
             for p in inputs_row["products"])
+        defects = tuple(
+            (e["sheet_no"],
+             tuple((r["x"], r["y"], r["w"], r["h"]) for r in e["regions"]))
+            for e in inputs_row.get("defects", []))
         return Params(
             sheet_w=inputs_row["sheet_w"],
             sheet_h=inputs_row["sheet_h"],
             kerf=inputs_row["kerf"],
             max_sheets=inputs_row["max_sheets"],
             state_limit=state_limit,
-            products=products)
+            products=products,
+            defects=defects)
 
     @staticmethod
     def _public_result(result: dict, inputs_row: dict) -> dict:

@@ -40,6 +40,13 @@
       </table>
       <button type="button" id="addProduct" class="btn btn-ghost">+ 添加一种成品</button>
 
+      <h3>母纸瑕疵登记 <small>（可省略；完好母纸无需登记。同一纸号只能登记一次，
+        给出该纸全部矩形瑕疵区的左上角坐标与宽高，单位 mm；同纸瑕疵区可重叠；
+        成品不得压瑕疵，刀路与废料可穿过）</small></h3>
+      <div id="defectList" class="defect-list"></div>
+      <button type="button" id="addDefectSheet" class="btn btn-ghost">
+        + 登记一张带瑕疵母纸</button>
+
       <div class="searchline">
         <label class="statelim">搜索状态数上限
           <input type="number" min="1" step="1" id="state_limit" required>

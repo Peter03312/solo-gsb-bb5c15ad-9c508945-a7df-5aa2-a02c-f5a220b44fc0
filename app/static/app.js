@@ -14,7 +14,6 @@ let LAST_VERSION = null;  // 试算时所用输入版本
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => (
   { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-
 // ---------- 表单 ----------
 function productRow(p = {}) {
   const tr = document.createElement("tr");
@@ -39,6 +38,55 @@ function productRow(p = {}) {
   return tr;
 }
 
+// ---------- 瑕疵登记 ----------
+function defectRegionRow(r = {}) {
+  const tr = document.createElement("tr");
+  tr.className = "dreg";
+  tr.innerHTML = `
+    <td><input type="number" class="d-x" min="0" step="1"
+        value="${r.x ?? ""}"></td>
+    <td><input type="number" class="d-y" min="0" step="1"
+        value="${r.y ?? ""}"></td>
+    <td><input type="number" class="d-w" min="1" step="1"
+        value="${r.w ?? ""}"></td>
+    <td><input type="number" class="d-h" min="1" step="1"
+        value="${r.h ?? ""}"></td>
+    <td class="delcell"><button type="button" class="icon-btn"
+        title="删除该瑕疵区">✕</button></td>`;
+  tr.querySelector(".icon-btn").addEventListener("click", () => {
+    const tbody = tr.parentElement;
+    if (tbody.querySelectorAll(".dreg").length > 1) tr.remove();
+    else alert("每张已登记母纸至少保留一个瑕疵区；如该纸完好请整行删除");
+  });
+  return tr;
+}
+
+function defectSheetRow(entry = {}) {
+  const div = document.createElement("div");
+  div.className = "defect-sheet";
+  div.innerHTML = `
+    <div class="defect-head">
+      <label class="defect-no">纸号（1 起，每张母纸至多登记一次）
+        <input type="number" class="f-sheetno" min="1" step="1"
+          value="${entry.sheet_no ?? ""}"></label>
+      <button type="button" class="btn btn-ghost del-sheet">删除该纸登记</button>
+    </div>
+    <table class="dtable">
+      <thead><tr><th>左上角 x (mm)</th><th>左上角 y (mm)</th>
+        <th>宽 (mm)</th><th>高 (mm)</th><th></th></tr></thead>
+      <tbody class="dregions"></tbody>
+    </table>
+    <button type="button" class="btn btn-ghost add-region">+ 添加瑕疵区</button>`;
+  const tbody = div.querySelector(".dregions");
+  (entry.regions && entry.regions.length
+    ? entry.regions : [{}]).forEach((r) =>
+    tbody.appendChild(defectRegionRow(r)));
+  div.querySelector(".add-region").addEventListener("click", () =>
+    tbody.appendChild(defectRegionRow()));
+  div.querySelector(".del-sheet").addEventListener("click", () => div.remove());
+  return div;
+}
+
 function fillForm(inputs) {
   $("sheet_w").value = inputs.sheet_w;
   $("sheet_h").value = inputs.sheet_h;
@@ -48,6 +96,9 @@ function fillForm(inputs) {
   const tb = $("productRows");
   tb.innerHTML = "";
   inputs.products.forEach((p) => tb.appendChild(productRow(p)));
+  const dl = $("defectList");
+  dl.innerHTML = "";
+  (inputs.defects || []).forEach((e) => dl.appendChild(defectSheetRow(e)));
 }
 
 function readForm() {
@@ -66,6 +117,20 @@ function readForm() {
       rotatable: tr.querySelector(".f-rot").checked,
     });
   });
+  const defects = [];
+  document.querySelectorAll(".defect-sheet").forEach((box) => {
+    const sheet_no = num(box.querySelector(".f-sheetno"), "瑕疵纸号");
+    const regions = [];
+    box.querySelectorAll(".dreg").forEach((tr) => {
+      regions.push({
+        x: num(tr.querySelector(".d-x"), "瑕疵区 x"),
+        y: num(tr.querySelector(".d-y"), "瑕疵区 y"),
+        w: num(tr.querySelector(".d-w"), "瑕疵区宽"),
+        h: num(tr.querySelector(".d-h"), "瑕疵区高"),
+      });
+    });
+    defects.push({ sheet_no, regions });
+  });
   return {
     sheet_w: num($("sheet_w"), "母纸长度"),
     sheet_h: num($("sheet_h"), "母纸宽度"),
@@ -73,6 +138,7 @@ function readForm() {
     max_sheets: num($("max_sheets"), "张数上限"),
     state_limit: num($("state_limit"), "搜索状态数上限"),
     products,
+    defects,
   };
 }
 
@@ -153,10 +219,23 @@ function sheetSVG(sheet, products, kerf) {
   const scale = Math.min(maxPx / W, maxPx / H);
   const dw = W * scale, dh = H * scale, pad = 22;
   const p = [];
-  p.push(`<svg class="layout" viewBox="0 0 ${dw + pad * 2} ${dh + pad * 2}"
-    width="${dw + pad * 2}" height="${dh + pad * 2}" xmlns="http://www.w3.org/2000/svg">`);
+  p.push(`<svg class="layout" viewBox="0 ${-pad - 16} ${dw + pad * 2} ${dh + pad * 2 + 16}"
+    width="${dw + pad * 2}" height="${dh + pad * 2 + 16}" xmlns="http://www.w3.org/2000/svg">`);
+  // 瑕疵区（紫色斜纹块，在最底层；成品避让、刀路/废料可穿过）
+  const patId = `defpat-${sheet.sheet_index}`;
+  p.push(`<defs><pattern id="${patId}" patternUnits="userSpaceOnUse"
+    width="7" height="7" patternTransform="rotate(45)">
+    <rect width="7" height="7" fill="#f3e8ff"/>
+    <line x1="0" y1="0" x2="0" y2="7" stroke="#9b59b6" stroke-width="2"/>
+    </pattern></defs>`);
+  (sheet.defects || []).forEach((r) => {
+    p.push(`<rect x="${pad + r.x * scale}" y="${pad + r.y * scale}"
+      width="${r.w * scale}" height="${r.h * scale}"
+      fill="url(#${patId})" stroke="#9b59b6" stroke-width="1.2"
+      stroke-dasharray="4 2"/>`);
+  });
   p.push(`<rect x="${pad}" y="${pad}" width="${dw.toFixed(1)}"
-    height="${dh.toFixed(1)}" fill="#fafafa" stroke="#222" stroke-width="2"/>`);
+    height="${dh.toFixed(1)}" fill="none" stroke="#222" stroke-width="2"/>`);
   sheet.gaps.forEach((g) => {
     p.push(`<rect x="${pad + g.x * scale}" y="${pad + g.y * scale}"
       width="${Math.max(g.w * scale, 1.5)}" height="${g.h * scale}"
@@ -175,6 +254,8 @@ function sheetSVG(sheet, products, kerf) {
         text-anchor="middle" dominant-baseline="middle">${esc(name)}</text>`);
     }
   });
+  p.push(`<text x="${pad}" y="2" font-size="11" fill="#7d3c98">
+    纸号 ${sheet.sheet_no}（物理母纸编号；未使用的纸号不会出现）</text>`);
   p.push("</svg>");
   return p.join("");
 }
@@ -210,20 +291,28 @@ function renderResult(result) {
     return `<span><i style="background:${fill};border-color:${stroke}"></i>${esc(pr.name)}
       （${pr.length}×${pr.width}）</span>`;
   }).join("") + `<span><i style="background:#d62728;border-color:#d62728"></i>刀缝
-    （宽 ${STATE.inputs.kerf}mm，已扣除）</span>`;
+    （宽 ${STATE.inputs.kerf}mm，已扣除）</span>`
+    + `<span><i class="defect-lg"></i>瑕疵区（成品避让；刀路/废料可穿过）</span>`;
 
-  const blocks = result.sheets.map((sheet) => `
+  const usedNos = result.sheets.map((s) => s.sheet_no).sort((a, b) => a - b);
+  const blocks = result.sheets.map((sheet) => {
+    const defTxt = (sheet.defects || []).length
+      ? `本纸登记瑕疵 ${sheet.defects.length} 处` : "本纸完好";
+    return `
     <div class="sheet-block">
-      <h3>第 ${sheet.sheet_index} 张母纸
+      <h3>用纸 ${sheet.sheet_index} 张 · 物理纸号 <b>${sheet.sheet_no}</b>
         <span class="muted">（${sheet.width}×${sheet.height}mm ·
-        ${sheet.leaves.length} 件 · ${sheet.cuts.length} 刀）</span></h3>
+        ${defTxt} · ${sheet.leaves.length} 件 · ${sheet.cuts.length} 刀）</span></h3>
       <div class="legend">${legend}</div>
       <div class="sheet-cols">
         <div class="sheet-svg-wrap">${sheetSVG(sheet, products, STATE.inputs.kerf)}</div>
         ${renderCuts(sheet)}
       </div>
-    </div>`).join("");
-  $("sheetsBox").innerHTML = blocks;
+    </div>`;
+  }).join("");
+  $("sheetsBox").innerHTML =
+    `<p class="muted used-nos">实际使用物理纸号：${usedNos.join("、")}
+      （其余纸号跳过未用）</p>` + blocks;
   $("cutsBox").innerHTML = "";
 
   // 保存/导出按钮状态
@@ -354,11 +443,21 @@ function formMatchesSaved(payload, saved) {
     return false;
   }
   if (payload.products.length !== p.products.length) return false;
-  return payload.products.every((x, i) => {
+  if (!payload.products.every((x, i) => {
     const y = p.products[i];
     return x.name === y.name && x.length === y.length && x.width === y.width
       && x.qty === y.qty && x.rotatable === y.rotatable;
-  });
+  })) {
+    return false;
+  }
+  // 瑕疵登记：服务端已按纸号/坐标排序，这里按同一规则比较
+  const norm = (list) => (list || []).map((e) => ({
+    sheet_no: e.sheet_no,
+    regions: e.regions.map((r) => ({ x: r.x, y: r.y, w: r.w, h: r.h }))
+      .sort((a, b) => a.x - b.x || a.y - b.y || a.w - b.w || a.h - b.h),
+  })).sort((a, b) => a.sheet_no - b.sheet_no);
+  return JSON.stringify(norm(payload.defects))
+    === JSON.stringify(norm(p.defects || []));
 }
 
 async function savePlan() {
@@ -396,6 +495,8 @@ function setBusy(on) {
 // ---------- 事件 ----------
 $("addProduct").addEventListener("click", () =>
   $("productRows").appendChild(productRow()));
+$("addDefectSheet").addEventListener("click", () =>
+  $("defectList").appendChild(defectSheetRow()));
 $("inputForm").addEventListener("submit", (e) => {
   e.preventDefault();
   submitAndSolve(true);

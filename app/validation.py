@@ -13,6 +13,8 @@ MAX_SHEETS = 10_000
 MAX_STATE_LIMIT = 100_000_000
 MAX_PRODUCT_TYPES = 12
 MAX_NAME_LEN = 40
+# 单张母纸登记的瑕疵区数量上限（防止异常大负载）
+MAX_DEFECT_REGIONS = 200
 
 
 class ValidationError(Exception):
@@ -62,6 +64,76 @@ def _nonneg_int(value, name: str, field: str, maximum: int) -> int:
     return iv
 
 
+def _validate_defects(payload, sheet_w: int, sheet_h: int,
+                      max_sheets: int) -> list:
+    """校验母纸瑕疵登记：可按纸号（1..张数上限）各登记一次瑕疵区清单。
+
+    - 字段可省略 / 为 null（视为全部完好）；否则必须为数组；
+    - 纸号必须为 1..max_sheets 的正整数，同一纸号不得重复登记；
+    - 每个登记项 regions 必须为非空数组；
+    - 每个瑕疵区 x,y 为非负整数、w,h 为正整数，且完全位于母纸内
+      （x+w ≤ sheet_w、y+h ≤ sheet_h）；同纸瑕疵区允许重叠。
+    返回按纸号升序、区内矩形按 (x,y,w,h) 升序的规范化列表。
+    """
+    raw = payload.get("defects")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValidationError("瑕疵登记必须为数组（每项含纸号与瑕疵区清单）",
+                              "defects")
+    entries = []
+    seen = set()
+    for idx, entry in enumerate(raw):
+        fpfx = f"defects[{idx}]"
+        if not isinstance(entry, dict):
+            raise ValidationError("瑕疵登记项格式错误", fpfx)
+        sheet_no = _pos_int(entry.get("sheet_no"), "瑕疵纸号",
+                            f"{fpfx}.sheet_no", max_sheets)
+        if sheet_no in seen:
+            raise ValidationError(f"纸号 {sheet_no} 的瑕疵区清单重复登记"
+                                  "（每张母纸至多登记一次）",
+                                  f"{fpfx}.sheet_no")
+        seen.add(sheet_no)
+        regions_raw = entry.get("regions")
+        if not isinstance(regions_raw, list) or not regions_raw:
+            raise ValidationError(
+                f"纸号 {sheet_no} 的瑕疵区清单必须为非空数组；"
+                "完好母纸无需登记", f"{fpfx}.regions")
+        if len(regions_raw) > MAX_DEFECT_REGIONS:
+            raise ValidationError(
+                f"单张母纸瑕疵区不得超过 {MAX_DEFECT_REGIONS} 个",
+                f"{fpfx}.regions")
+        regions = []
+        for j, r in enumerate(regions_raw):
+            rfpfx = f"{fpfx}.regions[{j}]"
+            if not isinstance(r, dict):
+                raise ValidationError("瑕疵区格式错误", rfpfx)
+            x = _nonneg_int(r.get("x"), "瑕疵区左上角 x",
+                            f"{rfpfx}.x", sheet_w - 1)
+            y = _nonneg_int(r.get("y"), "瑕疵区左上角 y",
+                            f"{rfpfx}.y", sheet_h - 1)
+            w = _pos_int(r.get("w"), "瑕疵区宽度",
+                         f"{rfpfx}.w", sheet_w)
+            h = _pos_int(r.get("h"), "瑕疵区高度",
+                         f"{rfpfx}.h", sheet_h)
+            if x + w > sheet_w:
+                raise ValidationError(
+                    f"纸号 {sheet_no} 瑕疵区（x={x}, 宽={w}）越界："
+                    f"x+w={x + w} 超过母纸长度 {sheet_w}mm", rfpfx)
+            if y + h > sheet_h:
+                raise ValidationError(
+                    f"纸号 {sheet_no} 瑕疵区（y={y}, 高={h}）越界："
+                    f"y+h={y + h} 超过母纸宽度 {sheet_h}mm", rfpfx)
+            regions.append((x, y, w, h))
+        regions.sort()
+        entries.append({"sheet_no": sheet_no,
+                        "regions": [
+                            {"x": x, "y": y, "w": w, "h": h}
+                            for (x, y, w, h) in regions]})
+    entries.sort(key=lambda e: e["sheet_no"])
+    return entries
+
+
 def validate_inputs(payload: dict) -> dict:
     """校验并返回规范化后的输入字典；非法时抛 ValidationError。"""
     if not isinstance(payload, dict):
@@ -79,6 +151,8 @@ def validate_inputs(payload: dict) -> dict:
         raise ValidationError(
             f"刀缝宽度 {kerf}mm 必须小于母纸长宽 "
             f"（{sheet_w}×{sheet_h}mm）", "kerf")
+
+    defects = _validate_defects(payload, sheet_w, sheet_h, max_sheets)
 
     products_raw = payload.get("products")
     if not isinstance(products_raw, list) or not products_raw:
@@ -131,4 +205,5 @@ def validate_inputs(payload: dict) -> dict:
         "max_sheets": max_sheets,
         "state_limit": state_limit,
         "products": products,
+        "defects": defects,
     }
