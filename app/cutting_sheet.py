@@ -24,14 +24,33 @@ def _sheet_svg(sheet: dict, products: list, kerf: int, px: int = 520) -> str:
     W, H = sheet["width"], sheet["height"]
     scale = min(px / W, px / H)
     dw, dh = W * scale, H * scale
+    sheet_no = sheet.get("sheet_no", sheet.get("sheet_index"))
+    hatch_id = f"hatch{sheet_no}_{sheet.get('sheet_index', 0)}"
 
     parts = [
         f'<svg viewBox="0 0 {dw + 40:.1f} {dh + 40:.1f}" '
         f'width="{dw + 40:.1f}" height="{dh + 40:.1f}" '
         'class="layout" xmlns="http://www.w3.org/2000/svg">',
+        '<defs>'
+        f'<pattern id="{hatch_id}" patternUnits="userSpaceOnUse" '
+        'width="7" height="7" patternTransform="rotate(45)">'
+        '<rect width="7" height="7" fill="#5a4a3f" opacity="0.28"/>'
+        '<line x1="0" y1="0" x2="0" y2="7" stroke="#3d2f25" '
+        'stroke-width="2.2" opacity="0.55"/></pattern>'
+        '</defs>',
         f'<rect x="20" y="20" width="{dw:.1f}" height="{dh:.1f}" '
         'fill="#fafafa" stroke="#222" stroke-width="2"/>',
     ]
+    # 瑕疵区（棕色斜纹污点；刀路/废料可经过，成品不得覆盖）
+    for d in sheet.get("defects", []):
+        x = 20 + d["x"] * scale
+        y = 20 + d["y"] * scale
+        parts.append(
+            f'<rect x="{x:.2f}" y="{y:.2f}" '
+            f'width="{max(d["w"] * scale, 1):.2f}" '
+            f'height="{max(d["h"] * scale, 1):.2f}" '
+            f'fill="url(#{hatch_id})" stroke="#6b4a32" '
+            'stroke-width="1" stroke-dasharray="4 2"/>')
     # 刀缝（红色细条）
     for g in sheet["gaps"]:
         x = 20 + g["x"] * scale
@@ -85,8 +104,9 @@ def render_cutting_sheet(inputs: dict, solution_row: dict,
         for p in products)
 
     sheets_html = []
-    for sheet in result["sheets"]:
+    for order, sheet in enumerate(result["sheets"], start=1):
         idx = sheet["sheet_index"]
+        sheet_no = sheet.get("sheet_no", idx)
         svg = _sheet_svg(sheet, products, inputs["kerf"])
         cut_rows = []
         for c in sheet["cuts"]:
@@ -106,11 +126,26 @@ def render_cutting_sheet(inputs: dict, solution_row: dict,
             "<th>刀口位置</th><th>刀长(mm)</th><th>一刀后余料</th>"
             "<th>二刀后余料</th></tr></thead><tbody>"
             + "".join(cut_rows) + "</tbody></table>")
+        defects = sheet.get("defects", [])
+        if defects:
+            d_rows = "".join(
+                f"<li>瑕疵区 {j + 1}：左上角 ({d['x']}, {d['y']})mm，"
+                f"{d['w']}×{d['h']}mm</li>"
+                for j, d in enumerate(defects))
+            defects_box = (
+                '<div class="defects-box"><b>本纸瑕疵区（成品已避让，'
+                '刀路/废料可经过）：</b>'
+                f'<ul class="defects-list">{d_rows}</ul></div>')
+        else:
+            defects_box = ('<div class="defects-box defects-ok">'
+                           '本纸无瑕疵登记（完好纸）。</div>')
         sheets_html.append(
-            f'<section class="sheet-block"><h2>第 {idx} 张母纸 '
+            f'<section class="sheet-block"><h2>用纸第 {order} 张 · '
+            f'实际纸号 #{sheet_no} '
             f'<span class="muted">（{sheet["width"]}×{sheet["height"]}mm，'
             f'本张 {len(sheet["leaves"])} 件 / {len(sheet["cuts"])} 刀）'
-            f'</span></h2><div class="cols"><div>{svg}</div>'
+            f'</span></h2>{defects_box}'
+            f'<div class="cols"><div>{svg}</div>'
             f"<div>{cuts_table}</div></div></section>")
 
     legend = "".join(
@@ -118,6 +153,28 @@ def render_cutting_sheet(inputs: dict, solution_row: dict,
         f'border-color:{PALETTE[i % len(PALETTE)][0]}"></i>{_esc(p["name"])}'
         f'（{p["length"]}×{p["width"]}mm）</span>'
         for i, p in enumerate(products))
+
+    used_numbers = result.get("sheet_numbers_used") or [
+        s.get("sheet_no", s["sheet_index"]) for s in result["sheets"]]
+    defects_map = inputs.get("defects") or {}
+    reg_rows = []
+    for no in range(1, inputs["max_sheets"] + 1):
+        regions = defects_map.get(no) or defects_map.get(str(no))
+        used = "✔ 使用" if no in used_numbers else "— 跳过"
+        if regions:
+            desc = "；".join(
+                f"({r['x']},{r['y']}) {r['w']}×{r['h']}mm"
+                for r in regions)
+        else:
+            desc = "完好（未登记）"
+        cls = " class='used-yes'" if no in used_numbers else ""
+        reg_rows.append(
+            f"<tr{cls}><td class='num'>#{no}</td><td>{used}</td>"
+            f"<td>{_esc(desc)}</td></tr>")
+    defects_register = (
+        '<table class="regtable"><thead><tr><th>纸号</th><th>是否实际用纸</th>'
+        '<th>瑕疵登记（左上角 x,y；宽×高）</th></tr></thead><tbody>'
+        + "".join(reg_rows) + "</tbody></table>")
 
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -151,6 +208,18 @@ def render_cutting_sheet(inputs: dict, solution_row: dict,
   .lg i {{ width:14px; height:14px; display:inline-block; border:1px solid;
           border-radius:2px; }}
   .note {{ color:#a33; font-size:12px; }}
+  .defects-box {{ background:#f6f1ea; border:1px solid #ddcdb8;
+                 border-radius:6px; padding:7px 12px; margin:0 0 12px;
+                 font-size:12.5px; color:#5a4632; }}
+  .defects-box.defects-ok {{ background:#f4f8f4; border-color:#cfe0cf;
+                            color:#456b45; }}
+  .defects-list {{ margin:5px 0 2px; padding-left:20px; }}
+  .defects-list li {{ margin:2px 0; }}
+  .reghead {{ font-size:14px; margin:18px 0 8px; }}
+  .regtable {{ margin-bottom:14px; }}
+  .regtable tr.used-yes td {{ background:#f3f8f3; }}
+  .defect-lg {{ background:repeating-linear-gradient(45deg,#8a6a50 0 2px,
+                 rgba(138,106,80,.25) 2px 5px) !important; }}
   @media print {{ body {{ margin:8mm; }} .sheet-block {{ border:none; }} }}
 </style></head>
 <body>
@@ -164,7 +233,7 @@ def render_cutting_sheet(inputs: dict, solution_row: dict,
     <div>母纸：<b>{inputs['sheet_w']}×{inputs['sheet_h']}mm</b></div>
     <div>刀缝：<b>{inputs['kerf']}mm</b></div>
     <div>实际用纸：<b>{result['sheets_used']} 张</b>
-      （上限 {inputs['max_sheets']}）</div>
+      （上限 {inputs['max_sheets']}；纸号 {_esc('、'.join('#' + str(n) for n in used_numbers))}）</div>
     <div>搜索状态数：<b>{result.get('states_used','')}</b></div>
   </div>
 
@@ -172,9 +241,14 @@ def render_cutting_sheet(inputs: dict, solution_row: dict,
     <th>旋转</th><th>需求份数</th><th>实际成品数</th></tr></thead>
   <tbody>{prod_rows}</tbody></table>
 
+  <h3 class="reghead">母纸瑕疵登记与实际用纸</h3>
+  {defects_register}
+
   <div class="legend"><b>图例：</b>{legend}
     <span class="lg"><i style="background:#d62728;border-color:#d62728"></i>刀缝</span>
-    <span class="note">（↻ 表示该件为旋转摆放；刀缝宽度 {inputs['kerf']}mm 已扣除）</span>
+    <span class="lg"><i class="defect-lg"></i>瑕疵区（成品避让；刀路/废料可经过）</span>
+    <span class="note">（↻ 表示该件为旋转摆放；刀缝宽度 {inputs['kerf']}mm 已扣除；
+    成品仅可与瑕疵区边界相切，不得发生面积重叠）</span>
   </div>
 
   {''.join(sheets_html)}

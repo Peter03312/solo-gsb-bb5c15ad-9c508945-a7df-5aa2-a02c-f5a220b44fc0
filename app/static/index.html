@@ -54,6 +54,57 @@
     </form>
   </section>
 
+  <section class="card defect-card">
+    <h2>母纸瑕疵（污点）登记</h2>
+    <p class="mutable-note muted">
+      作坊母纸可能有局部污点：可按纸号（1～张数上限）逐张登记矩形瑕疵区，
+      给出左上角坐标与宽高（mm，以母纸左上角为原点）。<b>未登记视为完好</b>；
+      同一纸可有相互重叠的瑕疵区。排样时<strong>成品不得与瑕疵区面积重叠</strong>
+      （仅边界相切允许），但刀路、刀缝与废料允许经过；求解器可自动跳过
+      无法使用的脏纸。每次保存登记 / 删除都会使旧方案立即失效。
+    </p>
+    <div class="defect-addline">
+      <label>纸号
+        <input type="number" min="1" step="1" id="defSheet" class="def-no"></label>
+      <label>左上角 x (mm)
+        <input type="number" min="0" step="1" id="defX" class="def-coord"></label>
+      <label>左上角 y (mm)
+        <input type="number" min="0" step="1" id="defY" class="def-coord"></label>
+      <label>宽 (mm)
+        <input type="number" min="1" step="1" id="defW" class="def-coord"></label>
+      <label>高 (mm)
+        <input type="number" min="1" step="1" id="defH" class="def-coord"></label>
+      <button type="button" id="addDefect" class="btn btn-secondary">加入待提交清单</button>
+    </div>
+    <p id="defectError" class="form-error" hidden></p>
+    <h3>待提交（尚未保存）</h3>
+    <table class="dtable">
+      <thead><tr>
+        <th>纸号</th><th>左上角 x</th><th>左上角 y</th><th>宽 (mm)</th>
+        <th>高 (mm)</th><th></th>
+      </tr></thead>
+      <tbody id="defectDraftRows"></tbody>
+    </table>
+    <div class="defect-actions">
+      <button type="button" id="saveDefects" class="btn btn-primary">保存登记（逐纸提交）</button>
+      <button type="button" id="clearDraft" class="btn btn-ghost">清空待提交</button>
+      <span class="muted">同一纸号的多个瑕疵区请一次加入后一起保存；
+        已登记纸号需先删除再重新登记。</span>
+    </div>
+    <h3>已登记瑕疵（随当前输入版本保存）</h3>
+    <table class="dtable">
+      <thead><tr>
+        <th>纸号</th><th>左上角 x</th><th>左上角 y</th><th>宽 (mm)</th>
+        <th>高 (mm)</th><th>操作</th>
+      </tr></thead>
+      <tbody id="defectRows"></tbody>
+    </table>
+    <div class="defect-actions">
+      <button type="button" id="clearDefects" class="btn btn-ghost">清空全部已登记</button>
+      <span id="defectHint" class="muted"></span>
+    </div>
+  </section>
+
   <section class="card status-card" id="statusCard">
     <h2>搜索结果</h2>
     <div id="statusArea" class="status-area">

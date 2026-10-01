@@ -2,9 +2,13 @@
 
 服务端不盲信求解器或客户端回传的数据；只有通过全部下列检查才允许落库/
 导出裁切单：
-- 每张母纸尺寸正确、用纸张数不超过张数上限；
+- 每张母纸尺寸正确、实际用纸号合法（1..张数上限）且不重复，
+  用纸张数不超过张数上限；
 - 每个成品叶子尺寸等于某类成品（旋转需被允许）、在母纸内不越界；
 - 成品之间互不重叠（整数毫米逐格检查），且不侵入任何刀缝；
+- 成品矩形不得与该纸登记的任何瑕疵区发生“正面积”重叠
+  （边界相切允许；刀路、刀缝与废料可经过瑕疵区）；
+- 排样页自带的瑕疵区清单必须与当前输入登记完全一致（防篡改/防过期）；
 - 裁切步骤按执行顺序每刀都贯穿“当前”余料，刀口位置、刀后两块尺寸、
   刀缝宽度与排样完全自洽；
 - 各类成品实际数量恰好等于需求份数。
@@ -28,6 +32,33 @@ def _as_int(v, what):
     return v
 
 
+def _rects_overlap_area(a, b) -> bool:
+    """两轴对齐矩形是否有“正面积”交集（仅边界相切返回 False）。"""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    return ax < bx + bw and bx < ax + aw and ay < by + bh and by < ay + ah
+
+
+def _check_defect_list(defects, W: int, H: int, what: str) -> list:
+    """核验排样页自带瑕疵清单结构合法且在界内，返回 (x,y,w,h) 列表。"""
+    if not isinstance(defects, list):
+        raise PlanError(f"{what}瑕疵区清单格式错误")
+    out = []
+    for i, d in enumerate(defects):
+        if not isinstance(d, dict):
+            raise PlanError(f"{what}瑕疵区 #{i + 1} 格式错误")
+        x = _as_int(d.get("x"), "瑕疵区x")
+        y = _as_int(d.get("y"), "瑕疵区y")
+        w = _as_int(d.get("w"), "瑕疵区宽")
+        h = _as_int(d.get("h"), "瑕疵区高")
+        if w <= 0 or h <= 0 or x < 0 or y < 0:
+            raise PlanError(f"{what}瑕疵区 #{i + 1} 尺寸非法")
+        if x + w > W or y + h > H:
+            raise PlanError(f"{what}瑕疵区 #{i + 1} 越界")
+        out.append((x, y, w, h))
+    return out
+
+
 def verify(result: dict, inputs: dict) -> None:
     """通过则返回 None，否则抛 PlanError。"""
     if not isinstance(result, dict):
@@ -43,20 +74,60 @@ def verify(result: dict, inputs: dict) -> None:
     n = len(products)
     demand = [_as_int(p["qty"], "份数") for p in products]
 
+    # 当前输入登记的瑕疵：纸号(int) -> 规范化 (x,y,w,h) 列表
+    registered_raw = inputs.get("defects") or {}
+    registered: dict = {}
+    if isinstance(registered_raw, dict):
+        for key, regions in registered_raw.items():
+            try:
+                no = int(key)
+            except (TypeError, ValueError):
+                raise PlanError("输入瑕疵登记纸号非法")
+            reg_list = []
+            if not isinstance(regions, list):
+                raise PlanError("输入瑕疵登记格式错误")
+            for r in regions:
+                reg_list.append((
+                    _as_int(r.get("x"), "登记瑕疵x"),
+                    _as_int(r.get("y"), "登记瑕疵y"),
+                    _as_int(r.get("w"), "登记瑕疵宽"),
+                    _as_int(r.get("h"), "登记瑕疵高")))
+            registered[no] = sorted(reg_list)
+
     sheets = result.get("sheets")
     if not isinstance(sheets, list) or not sheets:
         raise PlanError("方案缺少排样数据")
     if len(sheets) > max_sheets:
         raise PlanError("方案用纸张数超过张数上限")
 
+    used_numbers = set()
     produced = [0] * n
 
-    for sh in sheets:
+    for order, sh in enumerate(sheets, start=1):
         if not isinstance(sh, dict):
             raise PlanError("排样页格式错误")
         if _as_int(sh.get("width"), "母纸宽") != W or \
            _as_int(sh.get("height"), "母纸高") != H:
             raise PlanError("排样母纸尺寸与输入不一致")
+
+        # ---- 实际用纸号：合法、不重复；缺省（旧方案）回退为顺序号 ----
+        if sh.get("sheet_no") is None:
+            sheet_no = _as_int(sh.get("sheet_index"), "母纸序号")
+            legacy = True
+        else:
+            sheet_no = _as_int(sh.get("sheet_no"), "实际用纸号")
+            legacy = False
+        if not (1 <= sheet_no <= max_sheets):
+            raise PlanError(f"实际用纸号 {sheet_no} 超出张数上限")
+        if sheet_no in used_numbers:
+            raise PlanError(f"实际用纸号 {sheet_no} 被重复使用")
+        used_numbers.add(sheet_no)
+        if _as_int(sh.get("sheet_index", order), "母纸序号") != order:
+            raise PlanError("排样页顺序号不连续")
+        # 求解器区域名以“物理纸号”为根；旧方案（无 sheet_no/瑕疵）
+        # 使用顺序号 + “张”的历史命名，二者都接受以保持向后兼容。
+        root = (f"第{sheet_no}张母纸" if legacy
+                else f"第{sheet_no}号母纸")
 
         leaves = sh.get("leaves")
         gaps = sh.get("gaps")
@@ -64,6 +135,15 @@ def verify(result: dict, inputs: dict) -> None:
         if not isinstance(leaves, list) or not isinstance(gaps, list) \
                 or not isinstance(cuts, list):
             raise PlanError("排样页数据不完整")
+
+        # ---- 瑕疵区：页内清单与输入登记必须逐项一致 ----
+        page_defects = _check_defect_list(
+            sh.get("defects", []), W, H, f"第{sheet_no}号纸")
+        expect = registered.get(sheet_no, [])
+        if sorted(page_defects) != expect:
+            raise PlanError(
+                f"第{sheet_no}号纸排样页瑕疵区与当前输入登记不一致"
+                "（方案可能基于旧输入，请重新搜索）")
 
         # ---- 叶子：尺寸、旋转、越界 ----
         leaf_rects = []  # (x, y, w, h, product_index)
@@ -89,6 +169,12 @@ def verify(result: dict, inputs: dict) -> None:
                 raise PlanError(f"成品「{prod['name']}」排样尺寸不匹配")
             if x < 0 or y < 0 or x + ww > W or y + hh > H:
                 raise PlanError(f"成品「{prod['name']}」越界")
+            # ---- 瑕疵避让：成品不得与任何瑕疵区正面积重叠 ----
+            for d in page_defects:
+                if _rects_overlap_area((x, y, ww, hh), d):
+                    raise PlanError(
+                        f"成品「{prod['name']}」与第{sheet_no}号纸瑕疵区 "
+                        f"{(d[0], d[1], d[2], d[3])} 发生面积重叠")
             leaf_rects.append((x, y, ww, hh, pi))
             produced[pi] += 1
 
@@ -121,8 +207,7 @@ def verify(result: dict, inputs: dict) -> None:
                     raise PlanError("成品侵入刀缝")
 
         # ---- 裁切步骤：顺序执行、贯穿当前余料、尺寸自洽 ----
-        sheet_index = _as_int(sh.get("sheet_index"), "母纸序号")
-        root = f"第{sheet_index}张母纸"
+        # root（根区域名）已按“物理纸号/旧方案顺序号”在前面算好。
         # 区域名 -> (x, y, w, h)，x/y 为其在母纸内的绝对坐标
         regions = {root: (0, 0, W, H)}
         internal = set()  # 被后续刀切过的区域（内部节点）

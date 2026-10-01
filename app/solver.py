@@ -4,27 +4,35 @@
 - 每一刀沿直线贯穿当前矩形余料，把它切成两块；
 - 刀缝（kerf）宽度在切分时扣除，两块余料之间留出刀缝；
 - 成品矩形不得旋转超出 rotatable 许可，不得重叠或越界；
-- 叶子节点为一块尺寸完全相同的成品，或纯废料。
+- 叶子节点为一块尺寸完全相同的成品，或纯废料；
+- 母纸可带局部瑕疵区（污点）：成品矩形不得与瑕疵区发生“正面积”
+  重叠（边界相切允许），而刀路、刀缝与废料块均可穿过瑕疵区。
+  因此成品叶子只允许出现在无瑕疵的末端余料中；瑕疵随切分被裁进
+  子余料（坐标裁剪），最终只能落入废料块。
 
 搜索引擎（精确目标填充 + 成败双重记忆）：
-- fill_exact(w,h,t)：把“恰好”数量向量 t 的成品放入 w×h 余料，
-  成功返回切分树，失败返回 None。成败只依赖 (w,h,t)，与调用方无关，
-  因此成功树与失败结论都可跨父节点安全记忆（无 caps 上下文污染）。
+- fill_exact(w,h,t,defs)：把“恰好”数量向量 t 的成品放入 w×h 余料，
+  defs 为该余料内（局部坐标）瑕疵区元组；成功返回切分树，失败 None。
+  成败只依赖 (w,h,t,defs)，与调用方/纸号无关，成功树与失败结论都可
+  跨父节点乃至跨纸张安全记忆（无上下文污染）。
   树节点自带外框尺寸：
     ("leaf",  w,h, i, rotated) / ("waste", w,h)
     ("cut",   w,h, orient, pos, tree_a, tree_b)
-- 切分：枚举刀口（归一化位置）与目标拆分 t = ta + tb（ta 可为 0，
-  对应一侧整块留废），两半各自递归 fill_exact；
-- 母纸层：枚举当前剩余需求 caps 的子向量 t 作为一张母纸的精确任务，
+- 切分：枚举刀口（成品边与瑕疵边的归一化位置）与目标拆分
+  t = ta + tb（ta 可为 0，对应一侧整块留废），两半各自递归 fill_exact；
+- 母纸层：每张物理母纸（可带各自的瑕疵登记）可选择使用或跳过；
+  枚举当前剩余需求 caps 的子向量 t 作为一张母纸的精确任务，
   要求含编号最小的待生产类（消除张序冗余），按面积利用率降序尝试；
 - 每次进入填充状态 / 尝试拆分 / 枚举母纸任务消耗一个状态预算：
     预算内全部穷尽仍无方案 => infeasible（已穷尽，可断言无解）；
     预算耗尽 => budget_exhausted（不得声称无解，可加大预算重试）；
     找到方案立即返回 => found。
 
-刀口位置归一化：只取成品在进刀方向上的边长 d 及镜像 size-kerf-d。
-guillotine 正常模式（normal patterns）定理保证：若存在可行贯通刀排样，
-则第一刀可平移到与某成品边缘对齐而不损失可行性，递归成立，故枚举完备。
+刀口位置归一化：只取成品在进刀方向上的边长 d 及镜像 size-kerf-d，
+并加入瑕疵边缘坐标及其镜像。guillotine 正常模式（normal patterns）
+定理在瑕疵场景下扩展为：若存在可行贯通刀排样，则第一刀可平移到与某
+成品边缘或某瑕疵边缘对齐而不损失可行性（夹在两者之间的刀口整体平移
+不改变“成品/瑕疵各落哪一侧”），递归成立，故枚举完备。
 """
 from __future__ import annotations
 
@@ -60,6 +68,9 @@ class Params:
     max_sheets: int
     state_limit: int
     products: tuple = field(default_factory=tuple)
+    # 瑕疵登记：((纸号, ((x,y,w,h), ...)), ...)，仅登记过的纸号出现，
+    # 未登记（不在元组中）视为完好纸。
+    defects: tuple = ()
 
 
 class Solver:
@@ -75,11 +86,33 @@ class Solver:
                 seen.add((prod.width, prod.length, True))
             self.opts.append(sorted(seen))
         self.area = [prod.length * prod.width for prod in params.products]
+        # 纸号 -> 局部坐标瑕疵区元组 (x,y,w,h)；只含登记过的纸
+        self.sheet_defects: dict = {}
+        for no, regions in params.defects:
+            self.sheet_defects[no] = tuple(
+                (r[0], r[1], r[2], r[3]) for r in regions)
         self.states = 0
-        self._ok: dict = {}     # (w,h,t) -> tree（成功记忆）
-        self._fail: set = set()  # (w,h,t)（失败记忆）
+        self._ok: dict = {}     # (w,h,t,defs) -> tree（成功记忆）
+        self._fail: set = set()  # (w,h,t,defs)（失败记忆）
         self._pos_cache: dict = {}
         self._split_cache: dict = {}
+
+    @staticmethod
+    def _clip_defects(defs, x0: int, y0: int, w: int, h: int):
+        """把局部坐标瑕疵区裁剪到余料 (x0,y0,w,h)（余料局部坐标）。
+
+        返回与余料有正面积交集的瑕疵区（坐标换算为余料局部坐标）；
+        仅沿边界相切的瑕疵丢弃（不影响成品摆放，也无需进入刀口枚举）。
+        """
+        out = []
+        for dx, dy, dw, dh in defs:
+            cx0 = max(dx, x0)
+            cy0 = max(dy, y0)
+            cx1 = min(dx + dw, x0 + w)
+            cy1 = min(dy + dh, y0 + h)
+            if cx1 > cx0 and cy1 > cy0:
+                out.append((cx0 - x0, cy0 - y0, cx1 - cx0, cy1 - cy0))
+        return tuple(sorted(out))
 
     # ---------- 预算 ----------
     def _tick(self) -> None:
@@ -88,30 +121,48 @@ class Solver:
             raise BudgetExceeded()
 
     # ---------- 归一化刀口位置 ----------
-    def _positions(self, size: int, dims: set, cache_key) -> list:
+    def _positions(self, size: int, dims: set, extra: set, cache_key) -> list:
+        """归一化刀口：成品边长 d、镜像 size-k-d，以及瑕疵边缘 e 与其镜像。
+
+        extra 为当前余料在进刀方向上的瑕疵边缘坐标集合（局部坐标）。
+        所有位置都必须在 [1, size-k-1]（切后两块余料宽/高至少 1）。
+        """
         cached = self._pos_cache.get(cache_key)
         if cached is not None:
             return cached
         k = self.k
         out = set()
         if size > k + 1:
+            hi = size - k - 1
             for d in dims:
-                if 1 <= d <= size - k - 1:
+                if 1 <= d <= hi:
                     out.add(d)
                     q = size - k - d
+                    if q >= 1:
+                        out.add(q)
+            for e in extra:
+                if 1 <= e <= hi:
+                    out.add(e)
+                    q = size - k - e
                     if q >= 1:
                         out.add(q)
         result = sorted(out)
         self._pos_cache[cache_key] = result
         return result
 
-    def _v_positions(self, w: int) -> list:
+    def _v_positions(self, w: int, defs: tuple) -> list:
         return self._positions(
-            w, {pw for opts in self.opts for pw, _ph, _r in opts}, ("v", w))
+            w, {pw for opts in self.opts for pw, _ph, _r in opts},
+            {x for x, _y, _dw, _dh in defs}
+            | {x + dw for x, _y, dw, _dh in defs},
+            ("v", w, defs))
 
-    def _h_positions(self, h: int) -> list:
+    def _h_positions(self, h: int, defs: tuple) -> list:
         return self._positions(
-            h, {ph for opts in self.opts for _pw, ph, _r in opts}, ("h", h))
+            h, {ph for opts in self.opts for _pw, ph, _r in opts},
+            {y for _x, y, _dw, _dh in defs}
+            | {y + dh for _x, y, _dw, dh in defs},
+            ("h", h, defs))
 
     @staticmethod
     def _is_rotated(prod, pw: int, ph: int) -> bool:
@@ -140,11 +191,14 @@ class Solver:
         return tas
 
     # ---------- 精确目标填充 ----------
-    def fill_exact(self, w: int, h: int, t: tuple):
-        """把恰好 t 份成品放入 w×h；返回 tree 或 None。"""
+    def fill_exact(self, w: int, h: int, t: tuple, defs: tuple = ()):
+        """把恰好 t 份成品放入 w×h；defs 为余料内瑕疵区（局部坐标）。
+
+        返回 tree 或 None。成品叶子只能落在无瑕疵处；废料叶子可带瑕疵。
+        """
         if not any(t):
             return ("waste", w, h)
-        key = (w, h, t)
+        key = (w, h, t, defs)
         if key in self._ok:
             return self._ok[key]
         if key in self._fail:
@@ -153,15 +207,17 @@ class Solver:
         n = self.n
         k = self.k
 
-        # 面积必要条件
+        # 面积必要条件（注意：瑕疵面积可能令实际可用面积更小，此处只是
+        # 宽松预检，真正的避让由叶子检查与切分枚举保证）
         need_area = sum(t[i] * self.area[i] for i in range(n))
         if need_area > w * h:
             self._fail.add(key)
             return None
 
-        # 单件叶子：尺寸恰好相等则直接成品；否则仍可能通过切分把该件
-        # 放在某一子块中（其余为废料），故不匹配时继续枚举切分。
-        if sum(t) == 1:
+        # 单件叶子：尺寸恰好相等“且”整块余料无任何正面积瑕疵时才可为成品；
+        # 否则仍可能通过切分把该件放在某一无瑕疵子块（其余为废料），
+        # 故带瑕疵或不匹配时继续枚举切分。
+        if sum(t) == 1 and not defs:
             i = next(j for j, c in enumerate(t) if c == 1)
             prod = self.p.products[i]
             for pw, ph, _rot in self.opts[i]:
@@ -173,14 +229,19 @@ class Solver:
         # 切分枚举：刀口 + 目标拆分。大尺寸刀口优先；拆分按两侧面积
         # 利用率降序（|a块需求面积 - a块面积| + |b块需求面积 - b块面积|）。
         cuts = []
-        for pos in self._v_positions(w):
+        for pos in self._v_positions(w, defs):
             wb = w - k - pos
             if wb >= 1:
-                cuts.append(("V", pos, pos, h, wb, h))
-        for pos in self._h_positions(h):
+                # 纵刀：左片 [0,pos)、右片 [pos+k,w)；刀缝本身可压瑕疵
+                d_a = self._clip_defects(defs, 0, 0, pos, h)
+                d_b = self._clip_defects(defs, pos + k, 0, wb, h)
+                cuts.append(("V", pos, pos, h, wb, h, d_a, d_b))
+        for pos in self._h_positions(h, defs):
             hb = h - k - pos
             if hb >= 1:
-                cuts.append(("H", pos, w, pos, w, hb))
+                d_a = self._clip_defects(defs, 0, 0, w, pos)
+                d_b = self._clip_defects(defs, 0, pos + k, w, hb)
+                cuts.append(("H", pos, w, pos, w, hb, d_a, d_b))
         cuts.sort(key=lambda c: -(c[2] * c[3]))
 
         splits = self._splits(t)
@@ -191,7 +252,7 @@ class Solver:
             db = abs(need_area - sa - area_b)
             return da + db
 
-        for orient, pos, wa, ha, wb, hb in cuts:
+        for orient, pos, wa, ha, wb, hb, d_a, d_b in cuts:
             area_a, area_b = wa * ha, wb * hb
             ordered = sorted(splits, key=lambda ta: split_score(ta, area_a, area_b))
             for ta in ordered:
@@ -199,12 +260,14 @@ class Solver:
                 sa = sum(ta[i] * self.area[i] for i in range(n))
                 if sa > area_a or need_area - sa > area_b:
                     continue
+                # 带成品的一侧若整块被子块内瑕疵完全“占死”到放不下任何
+                # 需求件，下面的递归会快速失败；此处不做昂贵精确预检。
                 self._tick()
                 tb = tuple(t[i] - ta[i] for i in range(n))
-                tree_a = self.fill_exact(wa, ha, ta)
+                tree_a = self.fill_exact(wa, ha, ta, d_a)
                 if tree_a is None:
                     continue
-                tree_b = self.fill_exact(wb, hb, tb)
+                tree_b = self.fill_exact(wb, hb, tb, d_b)
                 if tree_b is None:
                     continue
                 tree = ("cut", w, h, orient, pos, tree_a, tree_b)
@@ -242,12 +305,12 @@ class Solver:
             -sum(t), t))
         return out
 
-    # ---------- 全局：多张母纸 ----------
+    # ---------- 全局：多张物理母纸（可跳过带瑕疵纸） ----------
     def solve(self) -> dict:
         demand = tuple(prod.qty for prod in self.p.products)
         W, H = self.p.sheet_w, self.p.sheet_h
 
-        # 确定性必要条件预检（不耗搜索预算，结论确定）
+        # 确定性必要条件预检（不耗搜索预算，结论确定；与瑕疵无关）
         for i, prod in enumerate(self.p.products):
             if not any(pw <= W and ph <= H
                        for pw, ph, _rot in self.opts[i]):
@@ -263,31 +326,42 @@ class Solver:
 
         fail_memo: set = set()
 
-        def dfs(caps: tuple, used: int):
+        def dfs(caps: tuple, s: int):
+            """从纸号 s 开始（1 基），有序选择纸张满足剩余需求 caps。
+
+            对每张纸先“用”（承担任一含最小编号待生产类的子任务）后
+            “跳过”。完好纸从不跳过（跳过完好纸只会少一个选择，
+            无完备性损失，且与无瑕疵时的旧行为一致）；带瑕疵纸可跳过。
+            """
             if not any(caps):
                 return []
-            remaining = self.p.max_sheets - used
-            if remaining <= 0:
+            if s > self.p.max_sheets:
                 return None
-            fkey = (caps, remaining)
+            fkey = (caps, s)
             if fkey in fail_memo:
                 return None
             self._tick()
             must = next(j for j, c in enumerate(caps) if c > 0)
+            root_defs = self.sheet_defects.get(s, ())
             for t in self._sheet_targets(caps, must):
                 self._tick()
-                tree = self.fill_exact(W, H, t)
+                tree = self.fill_exact(W, H, t, root_defs)
                 if tree is None:
                     continue
                 rem = tuple(caps[i] - t[i] for i in range(self.n))
-                sub = dfs(rem, used + 1)
+                sub = dfs(rem, s + 1)
                 if sub is not None:
-                    return [(t, tree)] + sub
+                    return [(s, t, tree)] + sub
+            # 只有登记过瑕疵的纸允许跳过（完好纸跳过没有意义）
+            if s in self.sheet_defects:
+                sub = dfs(caps, s + 1)
+                if sub is not None:
+                    return sub
             fail_memo.add(fkey)
             return None
 
         try:
-            plans = dfs(demand, 0)
+            plans = dfs(demand, 1)
         except BudgetExceeded:
             return self._result(STATUS_BUDGET, [])
 
@@ -308,8 +382,8 @@ class Solver:
     def _build_found(self, plans: list) -> dict:
         sheets = []
         produced = [0] * self.n
-        for idx, (_t, tree) in enumerate(plans, start=1):
-            layout = self._flatten(idx, tree)
+        for order, (sheet_no, _t, tree) in enumerate(plans, start=1):
+            layout = self._flatten(order, sheet_no, tree)
             sheets.append(layout)
             for leaf in layout["leaves"]:
                 produced[leaf["product"]] += 1
@@ -326,10 +400,11 @@ class Solver:
         ]
         res = self._result(STATUS_FOUND, sheets)
         res["counts"] = counts
+        res["sheet_numbers_used"] = [sheet_no for sheet_no, _t, _tree in plans]
         return res
 
     # ---------- 展平：坐标、刀缝、按执行顺序的贯通刀步骤 ----------
-    def _flatten(self, sheet_index: int, tree) -> dict:
+    def _flatten(self, sheet_index: int, sheet_no: int, tree) -> dict:
         W, H = self.p.sheet_w, self.p.sheet_h
         leaves = []
         cuts_raw = []
@@ -350,11 +425,12 @@ class Solver:
             _c, _w, _h, orient, pos, a_node, b_node = node
             wa, ha = a_node[1], a_node[2]
             wb, hb = b_node[1], b_node[2]
-            region = self._region_name(sheet_index, path)
+            region = self._region_name(sheet_no, path)
             if orient == "V":
                 edge_a, edge_b = "左片", "右片"
                 cuts_raw.append({
                     "sheet": sheet_index,
+                    "sheet_no": sheet_no,
                     "region": region,
                     "direction": "纵向（垂直刀，自上而下贯穿当前余料）",
                     "at_label": f"距该余料左边缘 {pos}mm",
@@ -372,6 +448,7 @@ class Solver:
                 edge_a, edge_b = "上片", "下片"
                 cuts_raw.append({
                     "sheet": sheet_index,
+                    "sheet_no": sheet_no,
                     "region": region,
                     "direction": "横向（水平刀，自左而右贯穿当前余料）",
                     "at_label": f"距该余料上边缘 {pos}mm",
@@ -392,20 +469,28 @@ class Solver:
             c2 = dict(c)
             c2["seq"] = seq
             cuts.append(c2)
+        # 本纸登记的瑕疵区原样输出（坐标即母纸内绝对坐标），供页面与
+        # 裁切单标示、供独立核验复核避让关系。
+        defects_out = [
+            {"x": x, "y": y, "w": w, "h": h}
+            for x, y, w, h in self.sheet_defects.get(sheet_no, ())
+        ]
         return {
             "sheet_index": sheet_index,
+            "sheet_no": sheet_no,
             "width": W,
             "height": H,
             "leaves": leaves,
             "gaps": gaps,
             "cuts": cuts,
+            "defects": defects_out,
         }
 
     @staticmethod
-    def _region_name(sheet_index: int, path: list) -> str:
+    def _region_name(sheet_no: int, path: list) -> str:
         if not path:
-            return f"第{sheet_index}张母纸"
-        return f"第{sheet_index}张母纸 / " + " / ".join(path)
+            return f"第{sheet_no}号母纸"
+        return f"第{sheet_no}号母纸 / " + " / ".join(path)
 
 
 def run(params: Params) -> dict:

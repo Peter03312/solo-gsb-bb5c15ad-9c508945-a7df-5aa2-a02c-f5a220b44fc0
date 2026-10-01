@@ -32,6 +32,7 @@ def default_inputs() -> dict:
             {"name": "卡片B", "length": 200, "width": 60,
              "qty": 4, "rotatable": False},
         ],
+        "defects": {},
     }
 
 
@@ -101,13 +102,26 @@ class Database:
         data = json.loads(row["payload"])
         data["input_version"] = row["input_version"]
         data["updated_at"] = row["updated_at"]
+        # JSON 往返后瑕疵登记的纸号键变为字符串，统一转回整数键
+        raw_defects = data.get("defects")
+        defects = {}
+        if isinstance(raw_defects, dict):
+            for key, regions in raw_defects.items():
+                try:
+                    defects[int(key)] = regions
+                except (TypeError, ValueError):
+                    continue
+        data["defects"] = {no: defects[no] for no in sorted(defects)}
         return data
 
     def replace_inputs(self, inputs: dict) -> dict:
         """校验通过后的输入整体替换；版本号 +1，并使任何旧方案失效。"""
         clean = {k: inputs[k] for k in
                  ("sheet_w", "sheet_h", "kerf", "max_sheets",
-                  "state_limit", "products")}
+                  "state_limit", "products", "defects")}
+        # SQLite JSON 要求对象键为字符串：瑕疵登记以纸号字符串为键
+        clean["defects"] = {str(no): clean["defects"][no]
+                            for no in sorted(clean["defects"])}
         payload = json.dumps(clean, ensure_ascii=False)
         with self._lock, self._connect() as conn:
             row = conn.execute(
@@ -122,8 +136,70 @@ class Database:
                 "UPDATE solution SET valid=0, saved_at=datetime('now') "
                 "WHERE id=1")
         data = dict(clean)
+        # 对外仍以整数纸号为键
+        data["defects"] = {int(k): v for k, v in data["defects"].items()}
         data["input_version"] = new_version
         return data
+
+    def _bump_version_with(self, conn, new_payload: dict) -> int:
+        """同一事务内写回输入、版本 +1、旧方案失效；返回新版本号。"""
+        row = conn.execute(
+            "SELECT input_version FROM config WHERE id=1").fetchone()
+        new_version = row["input_version"] + 1
+        conn.execute(
+            "UPDATE config SET input_version=?, payload=?, "
+            "updated_at=datetime('now') WHERE id=1",
+            (new_version, json.dumps(new_payload, ensure_ascii=False)))
+        conn.execute(
+            "UPDATE solution SET valid=0, saved_at=datetime('now') "
+            "WHERE id=1")
+        return new_version
+
+    def register_defects(self, sheet_no: int, regions: list) -> dict:
+        """登记某一纸号的瑕疵区清单（每纸号仅可登记一次）。
+
+        重复纸号抛 DuplicateDefectError；成功则版本 +1、旧方案失效。
+        """
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT input_version, payload FROM config "
+                "WHERE id=1").fetchone()
+            data = json.loads(row["payload"])
+            defects = data.get("defects") or {}
+            if str(sheet_no) in defects:
+                raise DuplicateDefectError(
+                    f"纸号 {sheet_no} 已登记瑕疵区；如需变更请先删除该纸号登记")
+            defects[str(sheet_no)] = regions
+            data["defects"] = {k: defects[k] for k in sorted(defects,
+                                                             key=lambda z: int(z))}
+            new_version = self._bump_version_with(conn, data)
+        return self.get_inputs()
+
+    def delete_defects(self, sheet_no: int | None = None) -> dict:
+        """删除某一纸号（None 为全部）的瑕疵登记。
+
+        被删纸号原本未登记时抛 MissingDefectError；确有删除则版本 +1。
+        返回删除后的当前输入（get_inputs 形态，瑕疵键为整数）。
+        """
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT input_version, payload FROM config "
+                "WHERE id=1").fetchone()
+            data = json.loads(row["payload"])
+            defects = data.get("defects") or {}
+            if sheet_no is None:
+                changed = bool(defects)
+                defects = {}
+            else:
+                if str(sheet_no) not in defects:
+                    raise MissingDefectError(f"纸号 {sheet_no} 尚未登记瑕疵区")
+                defects = {k: v for k, v in defects.items()
+                           if int(k) != sheet_no}
+                changed = True
+            data["defects"] = defects
+            if changed:
+                self._bump_version_with(conn, data)
+        return self.get_inputs()
 
     # ---------- 方案 ----------
     def get_solution(self) -> dict:
@@ -169,3 +245,11 @@ class Database:
 
 class StaleVersionError(Exception):
     """方案所依据的输入版本与当前版本不一致（方案已失效）。"""
+
+
+class DuplicateDefectError(Exception):
+    """同一纸号的瑕疵区被重复登记。"""
+
+
+class MissingDefectError(Exception):
+    """试图删除一个并不存在的瑕疵登记。"""

@@ -10,6 +10,7 @@ const PALETTE = [
 let STATE = { inputs: null, solution: null };
 let LAST_RESULT = null;   // 最近一次试算结果（含 input_version）
 let LAST_VERSION = null;  // 试算时所用输入版本
+let DEFECT_DRAFT = [];    // 待提交瑕疵区 [{sheet_no,x,y,w,h}]
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => (
@@ -73,7 +74,161 @@ function readForm() {
     max_sheets: num($("max_sheets"), "张数上限"),
     state_limit: num($("state_limit"), "搜索状态数上限"),
     products,
+    defects: defectsFromState(STATE.inputs),
   };
+}
+
+// ---------- 瑕疵登记 ----------
+function defectsFromState(inputs) {
+  // 服务端返回 { "1": [...], "3": [...] }（JSON 键为字符串）
+  const out = {};
+  const d = (inputs && inputs.defects) || {};
+  Object.keys(d).sort((a, b) => Number(a) - Number(b)).forEach((no) => {
+    out[no] = d[no].map((r) => ({ x: r.x, y: r.y, w: r.w, h: r.h }));
+  });
+  return out;
+}
+
+function renderDefects() {
+  const tbody = $("defectRows");
+  const defects = (STATE.inputs && STATE.inputs.defects) || {};
+  const nos = Object.keys(defects).sort((a, b) => Number(a) - Number(b));
+  tbody.innerHTML = "";
+  if (!nos.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="muted">暂无登记（全部母纸视为完好）。</td></tr>';
+    return;
+  }
+  nos.forEach((no) => {
+    defects[no].forEach((r, j) => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td class="n">#${esc(no)}${j === 0 ? `<button type="button"
+          class="del-sheet-btn" data-no="${esc(no)}"
+          title="删除该纸全部瑕疵">✕删纸</button>` : ""}</td>
+        <td class="n">${r.x}</td><td class="n">${r.y}</td>
+        <td class="n">${r.w}</td><td class="n">${r.h}</td><td></td>`;
+      tbody.appendChild(tr);
+    });
+  });
+  tbody.querySelectorAll(".del-sheet-btn").forEach((btn) => {
+    btn.addEventListener("click", () => deleteDefects(Number(btn.dataset.no)));
+  });
+}
+
+function renderDraft() {
+  const tbody = $("defectDraftRows");
+  tbody.innerHTML = "";
+  if (!DEFECT_DRAFT.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="muted">（空）</td></tr>';
+    return;
+  }
+  DEFECT_DRAFT.forEach((r, idx) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td class="n">#${r.sheet_no}</td>
+      <td class="n">${r.x}</td><td class="n">${r.y}</td>
+      <td class="n">${r.w}</td><td class="n">${r.h}</td>
+      <td><button type="button" class="icon-btn del-draft"
+        data-idx="${idx}" title="移除">✕</button></td>`;
+    tbody.appendChild(tr);
+  });
+  tbody.querySelectorAll(".del-draft").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      DEFECT_DRAFT.splice(Number(btn.dataset.idx), 1);
+      renderDraft();
+    });
+  });
+}
+
+function showDefectError(msg) {
+  const box = $("defectError");
+  box.hidden = false;
+  box.textContent = msg;
+}
+
+async function addDefectToDraft() {
+  $("defectError").hidden = true;
+  const intVal = (id, name) => {
+    const v = $(id).value.trim();
+    if (!/^-?\d+$/.test(v)) throw new Error(`${name}必须为整数`);
+    return parseInt(v, 10);
+  };
+  let rec;
+  try {
+    const sheet_no = intVal("defSheet", "纸号");
+    const x = intVal("defX", "x");
+    const y = intVal("defY", "y");
+    const w = intVal("defW", "宽");
+    const h = intVal("defH", "高");
+    const maxSheets = STATE.inputs.max_sheets;
+    const W = STATE.inputs.sheet_w, H = STATE.inputs.sheet_h;
+    if (!(sheet_no >= 1 && sheet_no <= maxSheets))
+      throw new Error(`纸号必须在 1 至张数上限 ${maxSheets} 之间`);
+    if (x < 0 || y < 0) throw new Error("左上角坐标必须为非负整数");
+    if (w <= 0 || h <= 0) throw new Error("瑕疵宽高必须为正整数");
+    if (x + w > W || y + h > H)
+      throw new Error(`瑕疵区越界：必须整体落在母纸 ${W}×${H}mm 内`);
+    const saved = defectsFromState(STATE.inputs);
+    if (saved[String(sheet_no)])
+      throw new Error(`纸号 #${sheet_no} 已登记；请先删除该纸登记再重新添加`);
+    if (DEFECT_DRAFT.some((d) => d.sheet_no === sheet_no)
+        && !confirm(`待提交清单中已有纸号 #${sheet_no} 的瑕疵区，继续添加同纸另一区？`)) {
+      return;
+    }
+    rec = { sheet_no, x, y, w, h };
+  } catch (e) {
+    showDefectError(e.message);
+    return;
+  }
+  DEFECT_DRAFT.push(rec);
+  renderDraft();
+  ["defX", "defY", "defW", "defH"].forEach((id) => { $(id).value = ""; });
+}
+
+async function saveDefects() {
+  if (!DEFECT_DRAFT.length) { showDefectError("待提交清单为空"); return; }
+  // 按纸号分组逐纸提交；任一失败即停止（服务端不保存非法项）
+  const bySheet = new Map();
+  DEFECT_DRAFT.forEach((r) => {
+    if (!bySheet.has(r.sheet_no)) bySheet.set(r.sheet_no, []);
+    bySheet.get(r.sheet_no).push({ x: r.x, y: r.y, w: r.w, h: r.h });
+  });
+  for (const [no, regions] of [...bySheet.entries()]
+      .sort((a, b) => a[0] - b[0])) {
+    const r = await api("/api/defects", {
+      method: "POST",
+      body: JSON.stringify({ sheet_no: no, regions }),
+    });
+    if (!r.ok) { showDefectError(r.data.error || "登记失败"); return; }
+    STATE = r.data;
+  }
+  DEFECT_DRAFT = [];
+  $("defectError").hidden = true;
+  fillForm(STATE.inputs);
+  statusPill();
+  renderDefects();
+  renderDraft();
+  updateSaveUI();
+  $("statusArea").innerHTML =
+    '<p class="muted">瑕疵登记已保存，输入版本已更新；旧方案已失效，请重新搜索。</p>';
+  $("resultCard").hidden = true;
+}
+
+async function deleteDefects(no) {
+  const target = no == null ? "/api/defects"
+    : `/api/defects?sheet_no=${encodeURIComponent(no)}`;
+  const label = no == null ? "全部已登记瑕疵" : `纸号 #${no} 的登记`;
+  if (!confirm(`确定删除${label}吗？删除后旧方案将立即失效。`)) return;
+  const r = await api(target, { method: "DELETE" });
+  if (!r.ok) { alert(r.data.error || "删除失败"); return; }
+  STATE = r.data;
+  fillForm(STATE.inputs);
+  statusPill();
+  renderDefects();
+  updateSaveUI();
+  $("statusArea").innerHTML =
+    '<p class="muted">瑕疵登记已删除，输入版本已更新；旧方案已失效，请重新搜索。</p>';
+  $("resultCard").hidden = true;
 }
 
 function clearInvalid() {
@@ -152,11 +307,23 @@ function sheetSVG(sheet, products, kerf) {
   const maxPx = 480;
   const scale = Math.min(maxPx / W, maxPx / H);
   const dw = W * scale, dh = H * scale, pad = 22;
+  const hatchId = `webhatch_${sheet.sheet_index}_${sheet.sheet_no || 0}`;
   const p = [];
   p.push(`<svg class="layout" viewBox="0 0 ${dw + pad * 2} ${dh + pad * 2}"
     width="${dw + pad * 2}" height="${dh + pad * 2}" xmlns="http://www.w3.org/2000/svg">`);
+  p.push(`<defs><pattern id="${hatchId}" patternUnits="userSpaceOnUse"
+    width="7" height="7" patternTransform="rotate(45)">
+    <rect width="7" height="7" fill="#6b4a32" opacity="0.22"/>
+    <line x1="0" y1="0" x2="0" y2="7" stroke="#4a3425" stroke-width="2"
+      opacity="0.5"/></pattern></defs>`);
   p.push(`<rect x="${pad}" y="${pad}" width="${dw.toFixed(1)}"
     height="${dh.toFixed(1)}" fill="#fafafa" stroke="#222" stroke-width="2"/>`);
+  (sheet.defects || []).forEach((d) => {
+    p.push(`<rect x="${pad + d.x * scale}" y="${pad + d.y * scale}"
+      width="${Math.max(d.w * scale, 1.5)}" height="${Math.max(d.h * scale, 1.5)}"
+      fill="url(#${hatchId})" stroke="#6b4a32" stroke-width="1"
+      stroke-dasharray="4 2"/>`);
+  });
   sheet.gaps.forEach((g) => {
     p.push(`<rect x="${pad + g.x * scale}" y="${pad + g.y * scale}"
       width="${Math.max(g.w * scale, 1.5)}" height="${g.h * scale}"
@@ -210,19 +377,29 @@ function renderResult(result) {
     return `<span><i style="background:${fill};border-color:${stroke}"></i>${esc(pr.name)}
       （${pr.length}×${pr.width}）</span>`;
   }).join("") + `<span><i style="background:#d62728;border-color:#d62728"></i>刀缝
-    （宽 ${STATE.inputs.kerf}mm，已扣除）</span>`;
+    （宽 ${STATE.inputs.kerf}mm，已扣除）</span>`
+    + `<span><i class="defect-icon"></i>瑕疵区（成品避让；刀路/废料可经过）</span>`;
 
-  const blocks = result.sheets.map((sheet) => `
+  const usedNumbers = result.sheet_numbers_used
+    || result.sheets.map((s) => s.sheet_no || s.sheet_index);
+  const blocks = result.sheets.map((sheet, i) => {
+    const no = sheet.sheet_no || sheet.sheet_index;
+    const dcount = (sheet.defects || []).length;
+    const dlabel = dcount
+      ? `<span class="defect-badge">本纸 ${dcount} 个瑕疵区（已避让）</span>`
+      : '<span class="clean-badge">完好纸</span>';
+    return `
     <div class="sheet-block">
-      <h3>第 ${sheet.sheet_index} 张母纸
+      <h3>用纸第 ${sheet.sheet_index} 张 · 实际纸号 #${no}
         <span class="muted">（${sheet.width}×${sheet.height}mm ·
-        ${sheet.leaves.length} 件 · ${sheet.cuts.length} 刀）</span></h3>
+        ${sheet.leaves.length} 件 · ${sheet.cuts.length} 刀）</span> ${dlabel}</h3>
       <div class="legend">${legend}</div>
       <div class="sheet-cols">
         <div class="sheet-svg-wrap">${sheetSVG(sheet, products, STATE.inputs.kerf)}</div>
         ${renderCuts(sheet)}
       </div>
-    </div>`).join("");
+    </div>`;
+  }).join("");
   $("sheetsBox").innerHTML = blocks;
   $("cutsBox").innerHTML = "";
 
@@ -270,6 +447,8 @@ async function loadState() {
   STATE = data;
   fillForm(data.inputs);
   statusPill();
+  renderDefects();
+  renderDraft();
   if (data.solution.valid && data.solution.payload) {
     $("statusArea").innerHTML =
       `<div class="banner found"><span class="big">✔ 已有保存的有效方案
@@ -307,8 +486,15 @@ async function submitAndSolve(saveInputsFirst) {
         return;
       }
       STATE = r1.data;
+      // 保存输入会整体替换（含其自带 defects 字段）；草稿若纸号已超新上限则清空
+      DEFECT_DRAFT = DEFECT_DRAFT.filter((d) =>
+        d.sheet_no <= STATE.inputs.max_sheets
+        && d.x + d.w <= STATE.inputs.sheet_w
+        && d.y + d.h <= STATE.inputs.sheet_h);
       fillForm(STATE.inputs);
       statusPill();
+      renderDefects();
+      renderDraft();
       ver = STATE.inputs.input_version;
     } else {
       // 仅试算：表单里的 state_limit 之外的输入尚未保存，直接试算
@@ -334,7 +520,10 @@ async function submitAndSolve(saveInputsFirst) {
     });
     if (!r2.ok) {
       showFormError(r2.data);
-      if (r2.data.inputs) { STATE = r2.data; fillForm(STATE.inputs); statusPill(); }
+      if (r2.data.inputs) {
+        STATE = r2.data; fillForm(STATE.inputs); statusPill();
+        renderDefects();
+      }
       return;
     }
     const result = r2.data.result;
@@ -354,11 +543,17 @@ function formMatchesSaved(payload, saved) {
     return false;
   }
   if (payload.products.length !== p.products.length) return false;
-  return payload.products.every((x, i) => {
+  const prodOk = payload.products.every((x, i) => {
     const y = p.products[i];
     return x.name === y.name && x.length === y.length && x.width === y.width
       && x.qty === y.qty && x.rotatable === y.rotatable;
   });
+  if (!prodOk) return false;
+  // 瑕疵登记也必须与已保存版本一致
+  const a = payload.defects, b = defectsFromState(saved);
+  const ak = Object.keys(a), bk = Object.keys(b);
+  if (ak.length !== bk.length) return false;
+  return ak.every((no) => JSON.stringify(a[no]) === JSON.stringify(b[no]));
 }
 
 async function savePlan() {
@@ -396,6 +591,10 @@ function setBusy(on) {
 // ---------- 事件 ----------
 $("addProduct").addEventListener("click", () =>
   $("productRows").appendChild(productRow()));
+$("addDefect").addEventListener("click", addDefectToDraft);
+$("saveDefects").addEventListener("click", saveDefects);
+$("clearDraft").addEventListener("click", () => { DEFECT_DRAFT = []; renderDraft(); });
+$("clearDefects").addEventListener("click", () => deleteDefects(null));
 $("inputForm").addEventListener("submit", (e) => {
   e.preventDefault();
   submitAndSolve(true);

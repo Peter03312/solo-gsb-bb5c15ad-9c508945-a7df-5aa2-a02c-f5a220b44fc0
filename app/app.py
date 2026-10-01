@@ -7,12 +7,19 @@
 - GET  /api/state            当前输入（含版本）+ 方案状态
 - POST /api/inputs           校验并替换输入；非法输入 400 且不落库；
                              保存成功后旧方案自动失效
+- POST /api/defects          按纸号登记矩形瑕疵区清单（每纸号一次）；
+                             尺寸非正/越界 400、重复纸号 409；成功后
+                             版本 +1、旧方案失效
+- DELETE /api/defects        删除瑕疵登记（?sheet_no=N 单删，缺省清空）；
+                             未登记纸号 404；确有删除则旧方案失效
 - POST /api/solve            用当前版本输入试算（不落库），返回
                              found / infeasible / budget_exhausted
-- POST /api/solution         保存试算方案（服务端独立几何核验 + 版本核对）
+                             （成品自动避让各纸瑕疵区，刀路/废料可经过）
+- POST /api/solution         保存试算方案（服务端独立几何+瑕疵核验 +
+                             版本核对）
 - DELETE /api/solution       手动废弃当前方案
-- GET  /api/cutting-sheet    导出有效方案的裁切单 HTML（标明输入版本；
-                             失效方案一律拒绝）
+- GET  /api/cutting-sheet    导出有效方案的裁切单 HTML（标明输入版本、
+                             实际用纸号与瑕疵区；失效方案一律拒绝）
 """
 from __future__ import annotations
 
@@ -22,10 +29,12 @@ import threading
 from urllib.parse import parse_qs
 
 from solver import Solver, Params, Product
-from validation import validate_inputs, ValidationError
+from validation import (validate_inputs, validate_defect_regions,
+                        ValidationError)
 from verify import verify, actual_counts, PlanError
 import cutting_sheet as cs
-from database import Database, StaleVersionError
+from database import (Database, StaleVersionError, DuplicateDefectError,
+                      MissingDefectError)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -53,6 +62,10 @@ class App:
                 return self._json(200, self._state(), start_response)
             if method == "POST" and path == "/api/inputs":
                 return self._update_inputs(environ, start_response)
+            if method == "POST" and path == "/api/defects":
+                return self._register_defects(environ, start_response)
+            if method == "DELETE" and path == "/api/defects":
+                return self._delete_defects(environ, start_response)
             if method == "POST" and path == "/api/solve":
                 return self._solve(environ, start_response)
             if method == "POST" and path == "/api/solution":
@@ -148,6 +161,73 @@ class App:
         updated = self.db.replace_inputs(clean)
         return self._json(200, {"ok": True, **self._state()}, start_response)
 
+    # ---------- 瑕疵登记 ----------
+    def _register_defects(self, environ, start_response):
+        """按纸号登记矩形瑕疵区清单（每纸号仅可登记一次）。
+
+        body：{"sheet_no": 2, "regions": [{"x":..,"y":..,"w":..,"h":..}]}
+        尺寸非正 / 越界 / 重复纸号一律 400（或 409）且不保存；
+        登记成功后输入版本 +1、旧方案立即失效。
+        """
+        try:
+            body = self._read_json(environ)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return self._json(400, {"error": "请求体不是合法 JSON"},
+                              start_response)
+        if not isinstance(body, dict):
+            return self._json(400, {"error": "请求体必须为 JSON 对象"},
+                              start_response)
+        inputs_row = self.db.get_inputs()
+        max_sheets = inputs_row["max_sheets"]
+        if isinstance(body.get("sheet_no"), bool) or \
+                not isinstance(body.get("sheet_no"), int):
+            return self._json(400, {"error": "纸号必须为 1 至张数上限之间的"
+                                             "正整数", "field": "sheet_no"},
+                              start_response)
+        sheet_no = body["sheet_no"]
+        if not (1 <= sheet_no <= max_sheets):
+            return self._json(400, {
+                "error": f"纸号必须在 1 至张数上限 {max_sheets} 之间",
+                "field": "sheet_no"}, start_response)
+        try:
+            regions = validate_defect_regions(
+                body.get("regions"), inputs_row["sheet_w"],
+                inputs_row["sheet_h"])
+        except ValidationError as exc:
+            return self._json(400, {"error": exc.message, "field": exc.field},
+                              start_response)
+        try:
+            self.db.register_defects(sheet_no, regions)
+        except DuplicateDefectError as exc:
+            return self._json(409, {"error": str(exc),
+                                    "field": "sheet_no",
+                                    **self._state()}, start_response)
+        return self._json(200, {"ok": True, **self._state()}, start_response)
+
+    def _delete_defects(self, environ, start_response):
+        """删除瑕疵登记：DELETE /api/defects 清空；
+        ?sheet_no=N 删除指定纸号（未登记 404）。删除同样令旧方案失效。"""
+        qs = parse_qs(environ.get("QUERY_STRING", ""))
+        sheet_no = None
+        if qs.get("sheet_no"):
+            raw = qs["sheet_no"][0]
+            try:
+                sheet_no = int(raw)
+            except ValueError:
+                return self._json(400, {"error": "纸号必须为整数",
+                                        "field": "sheet_no"}, start_response)
+            max_sheets = self.db.get_inputs()["max_sheets"]
+            if not (1 <= sheet_no <= max_sheets):
+                return self._json(400, {
+                    "error": f"纸号必须在 1 至张数上限 {max_sheets} 之间",
+                    "field": "sheet_no"}, start_response)
+        try:
+            self.db.delete_defects(sheet_no)
+        except MissingDefectError as exc:
+            return self._json(404, {"error": str(exc),
+                                    "field": "sheet_no"}, start_response)
+        return self._json(200, {"ok": True, **self._state()}, start_response)
+
     # ---------- 试算 ----------
     def _solve(self, environ, start_response):
         try:
@@ -198,13 +278,18 @@ class App:
             Product(p["name"], p["length"], p["width"], p["qty"],
                     bool(p["rotatable"]))
             for p in inputs_row["products"])
+        defects = tuple(
+            (no, tuple((r["x"], r["y"], r["w"], r["h"]) for r in regions))
+            for no, regions in sorted(
+                (inputs_row.get("defects") or {}).items()))
         return Params(
             sheet_w=inputs_row["sheet_w"],
             sheet_h=inputs_row["sheet_h"],
             kerf=inputs_row["kerf"],
             max_sheets=inputs_row["max_sheets"],
             state_limit=state_limit,
-            products=products)
+            products=products,
+            defects=defects)
 
     @staticmethod
     def _public_result(result: dict, inputs_row: dict) -> dict:
@@ -218,6 +303,7 @@ class App:
         if result["status"] == "found":
             out["sheets"] = result["sheets"]
             out["counts"] = result["counts"]
+            out["sheet_numbers_used"] = result.get("sheet_numbers_used", [])
         return out
 
     # ---------- 保存方案 ----------
